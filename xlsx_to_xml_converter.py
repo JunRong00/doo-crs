@@ -1,39 +1,30 @@
-# python xlsx_to_xml_converter.py CRS_Template_Revised_2.xlsx --split 5 --out C:/submissions/CRS_2024
+# python xlsx_to_xml_converter.py CRS_Template_Revised_2.xlsx --split 5 --out output_xml
 
 #!/usr/bin/env python3
 """
-CRS Excel to XML Converter  v3.0
-Converts a CRS template Excel file to one or more CRS XML Schema v3.0 files.
+FC XML Schema v2.2 Excel to XML Converter
+Converts a CRS template Excel file to FC XML Schema v2.2 files for submission
+to the Vanuatu MDES portal (https://mdes.doft.gov.vu/MDES/).
 
-Reference: Amended Common Reporting Standard XML Schema User Guide v4.0
-           OECD, October 2024 (doi:10.1787/dd7ee57a-en)
+Reference: FC XML Schema v2.2 User Guide v1.0
+           Vanuatu Customs and Inland Revenue
 
 Usage:
-    python crs_excel_to_xml.py <input.xlsx> [--split N] [--out <prefix>]
+    python xlsx_to_xml_converter.py <input.xlsx> [--split N] [--out <folder>]
 
 Arguments:
     input.xlsx       Path to the filled CRS Excel template.
     --split N        Split into N XML files with balanced rows. Default: 1.
-    --out <prefix>   Output filename prefix. Default: same stem as input.
-                     N=1  -> <prefix>_CRS.xml
-                     N>1  -> <prefix>_CRS_part01.xml, <prefix>_CRS_part02.xml ...
+    --out <folder>   Output folder for XML files (created if missing).
+                     Default: same folder as input.
 
 Outputs:
-    1. One or more CRS XML files.
-    2. A copy of the Excel with a new 'filepath' column on each account sheet
-       (Individual, Organisation, ControllingPerson, Payment) showing which
-       XML file each row was assigned to.
-
-Splitting logic:
-    - Splitting unit = account rows (Individual + Organisation combined).
-    - Rows are distributed using ceiling division so no file has more than
-      one extra row compared to any other file.
-    - Each split file has its own unique MessageRefId.
-    - ReportingFI block is identical in every split file (always required).
-    - ControllingPerson and Payment rows travel with their parent account.
+    1. One or more FC XML v2.2 files.
+    2. A copy of the Excel with a 'filepath' column on each account sheet.
 """
 
 import sys
+import os
 import math
 import uuid
 import shutil
@@ -42,32 +33,26 @@ import pandas as pd
 import openpyxl
 from openpyxl.styles import PatternFill, Font
 from openpyxl.utils import get_column_letter
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from xml.etree import ElementTree as ET
-from xml.dom import minidom
 
-# ── Namespaces (Appendix B, p.58) ─────────────────────────────────────────────
-NS = {
-    "crs": "urn:oecd:ties:crs:v3",
-    "stf": "urn:oecd:ties:crsstf:v5",
-    "cfc": "urn:oecd:ties:commontypesfatcacrs:v2",
-    "iso": "urn:oecd:ties:isocrstypes:v1",
-}
-for prefix, uri in NS.items():
-    ET.register_namespace(prefix, uri)
+# ── Namespaces ────────────────────────────────────────────────────────────────
+# FC XML Schema v2.2 namespaces.
+# Do NOT call ET.register_namespace() — Python reserves the ns\d+ prefix
+# pattern for internal auto-generation and raises ValueError if you try.
+# ElementTree auto-assigns ns0, ns1 in the order URIs are first encountered.
+NS_MAIN  = "urn:fatcacrs:ties:v2"             # → auto-assigned ns0
+NS_TYPES = "urn:oecd:ties:fatcacrstypes:v2"   # → auto-assigned ns1
+NS_STF   = "urn:oecd:ties:stffatcatypes:v2"   # → auto-assigned ns2 (Address + Name children)
 
-def crs(tag): return f"{{{NS['crs']}}}{tag}"
-def stf(tag): return f"{{{NS['stf']}}}{tag}"
-def cfc(tag): return f"{{{NS['cfc']}}}{tag}"
+def ft(tag): return f"{{{NS_MAIN}}}{tag}"    # ns0: wrapper only (FATCA_CRS, MessageHeader, MessageBody)
+def tp(tag): return f"{{{NS_TYPES}}}{tag}"   # ns1: main content elements
+def sf(tag): return f"{{{NS_STF}}}{tag}"     # ns2: Address children + Name children (stffatcatypes)
 
 # ── Template layout ────────────────────────────────────────────────────────────
-# After pd.read_excel(header=0), DataFrame rows are:
-#   0=Element/Attribute  1=Requirement  2=Size
-#   3=Input Type         4=Example      5=Separator (blank)
-#   6+ = actual data records
 REMARK_ROWS    = 6
-DATA_START_ROW = 8   # Excel row number where data begins (1-based)
+DATA_START_ROW = 8
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -86,8 +71,23 @@ def sub(parent, tag, text=None, attrib=None):
         el.text = text
     return el
 
-def uid(cc):
-    return f"{cc}{uuid.uuid4().hex[:12].upper()}"
+def make_doc_ref(tc, sending_in):
+    return f"{tc}{sending_in or ''}{uuid.uuid4()}"
+
+def read_excluded_jurisdictions(xl_dict):
+    key = next((k for k in xl_dict if k.strip().lower() == "excludedjurisdictions"), None)
+    if key is None:
+        return set()
+    df = xl_dict[key]
+    if len(df) < 7:
+        return set()
+    df = df.where(pd.notna(df), None)
+    codes = set()
+    for val in df.iloc[6:].iloc[:, 2]:
+        code = safe(val)
+        if code:
+            codes.add(code.upper())
+    return codes
 
 def bool_attr(val):
     if val is None:
@@ -113,18 +113,37 @@ def fmt_amount(val):
 def read_sheet(xl_dict, name):
     """
     Read a sheet by name (case-insensitive).
-    Skips the 6 remark rows, drops label column A,
-    lowercases column names, removes fully-empty rows.
+    Supports two template layouts:
+      Old: row 1 = field names, skip REMARK_ROWS rows.
+      New: has a 'Field →' row, then REMARK_ROWS metadata rows, then data.
+    Always drops col A (the label column) and lowercases column names.
     """
     key = next((k for k in xl_dict if k.strip().lower() == name.lower()), None)
     if key is None:
         return pd.DataFrame()
     df = xl_dict[key]
-    if len(df) <= REMARK_ROWS:
+
+    field_row_idx = None
+    for i in range(min(8, len(df))):
+        val = df.iloc[i, 0] if df.shape[1] > 0 else None
+        if val is not None and str(val).strip().lower().startswith("field"):
+            field_row_idx = i
+            break
+
+    if field_row_idx is not None:
+        col_names = [safe(v) or f"_col{j}" for j, v in enumerate(df.iloc[field_row_idx])]
+        df = df.iloc[field_row_idx + 1 + REMARK_ROWS:].reset_index(drop=True)
+        df.columns = col_names
+    else:
+        if len(df) <= REMARK_ROWS:
+            return pd.DataFrame()
+        df = df.iloc[REMARK_ROWS:].reset_index(drop=True)
+
+    if df.empty:
         return pd.DataFrame()
-    df = df.iloc[REMARK_ROWS:].reset_index(drop=True)
+
     if df.shape[1] > 0:
-        df = df.iloc[:, 1:]          # drop col A label
+        df = df.iloc[:, 1:]
     df.columns = [str(c).strip().lower() for c in df.columns]
     df = df.where(pd.notna(df), None)
     df = df.dropna(how="all").reset_index(drop=True)
@@ -134,10 +153,6 @@ def row_dict(row):
     return {str(k).strip().lower(): v for k, v in row.items()}
 
 def split_rows(df, n):
-    """
-    Distribute df rows into n balanced chunks using ceiling division.
-    Max difference between any two chunks is at most 1 row.
-    """
     total = len(df)
     if total == 0 or n <= 1:
         return [df]
@@ -146,25 +161,21 @@ def split_rows(df, n):
             for i in range(0, total, chunk_size)]
 
 def write_xml(root, path):
-    raw    = ET.tostring(root, encoding="unicode")
-    pretty = minidom.parseString(raw).toprettyxml(indent="  ", encoding="UTF-8")
+    ET.indent(root, space="  ")
     with open(path, "w", encoding="utf-8") as f:
         f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-        for line in pretty.decode("utf-8").splitlines():
-            if not line.startswith("<?xml"):
-                f.write(line + "\n")
+        f.write(ET.tostring(root, encoding="unicode"))
+        f.write("\n")
 
 # ── XML element builders ───────────────────────────────────────────────────────
 
-def build_doc_spec(parent, doc_type, doc_ref, corr_message_ref=None, corr_doc_ref=None):
-    """DocSpec_Type. Child names use CRS v3.0 schema casing."""
-    ds = sub(parent, stf("DocSpec"))
-    sub(ds, stf("DocTypeIndic"), doc_type or "OECD1")
-    sub(ds, stf("DocRefId"),     doc_ref)
-    if corr_message_ref:
-        sub(ds, stf("CorrMessageRefId"), corr_message_ref)
+def build_doc_spec(parent, doc_type, doc_ref, corr_doc_ref=None):
+    """DocSpec in FC types namespace (ns1). Values: OECD1/OECD2/OECD3."""
+    ds = sub(parent, tp("DocSpec"))
+    sub(ds, tp("DocTypeIndic"), doc_type or "OECD1")
+    sub(ds, tp("DocRefId"),     doc_ref)
     if corr_doc_ref:
-        sub(ds, stf("CorrDocRefId"), corr_doc_ref)
+        sub(ds, tp("CorrDocRefId"), corr_doc_ref)
     return ds
 
 def address_country(row):
@@ -177,21 +188,20 @@ def build_res_country(parent, row, required=False, context="party"):
                safe(row.get("address_countrycode")) or
                safe(row.get("countrycode")))
     if country:
-        sub(parent, crs("ResCountryCode"), country)
+        sub(parent, tp("ResCountryCode"), country)
         return country
     if required:
         raise ValueError(f"{context} is missing required ResCountryCode.")
     return None
 
-def build_address(parent, row, required=False, context="party"):
+def build_address(parent, row, required=False, context="party", force=False):
     """
-    Address_Type — Section IId, p.13-14.
-    legalAddressType = Attribute on Address element.
-    AddressFix order: Street, BuildingIdentifier, SuiteIdentifier,
-    FloorIdentifier, DistrictName, POB, PostCode, City (Validation), CountrySubentity.
+    FC v2.2 Address.
+    Attribute name: legalAddressType (per OECD XSD Address_Type).
+    Address element: ns1 (tp). CountryCode, AddressFix and children: ns2 (cf/cfc).
     """
     country   = address_country(row)
-    legal_type= safe(row.get("legaladdresstype"))
+    addr_type = safe(row.get("legaladdresstype"))  # column name unchanged in Excel
     addr_free = safe(row.get("addressfree"))
     street    = safe(row.get("street"))
     bldg      = safe(row.get("buildingidentifier"))
@@ -203,93 +213,88 @@ def build_address(parent, row, required=False, context="party"):
     city      = safe(row.get("city"))
     subentity = safe(row.get("countrysubentity"))
 
+    has_address = any([addr_free, street, bldg, suite, floor_id, district,
+                       pob, post_code, city, subentity])
     if not country and required:
         raise ValueError(f"{context} is missing required address CountryCode.")
-    if not country:
+    if not country and not force and not has_address:
         return None
 
-    attrib = {"legalAddressType": legal_type} if legal_type else {}
-    addr_el = ET.SubElement(parent, cfc("Address"), attrib)
-    sub(addr_el, cfc("CountryCode"), country)
+    attrib = {"legalAddressType": addr_type} if addr_type else {}   # per OECD XSD Address_Type
+    addr_el = ET.SubElement(parent, tp("Address"), attrib)
+    if country:
+        sub(addr_el, sf("CountryCode"), country)   # CountryCode is in Address_Type (cfc/ns2)
 
-    if addr_free and not any([street, bldg, city, post_code]):
-        sub(addr_el, cfc("AddressFree"), addr_free)
-    else:
-        fix = sub(addr_el, cfc("AddressFix"))
-        if street:    sub(fix, cfc("Street"),             street)
-        if bldg:      sub(fix, cfc("BuildingIdentifier"), bldg)
-        if suite:     sub(fix, cfc("SuiteIdentifier"),    suite)
-        if floor_id:  sub(fix, cfc("FloorIdentifier"),    floor_id)
-        if district:  sub(fix, cfc("DistrictName"),       district)
-        if pob:       sub(fix, cfc("POB"),                pob)
-        if post_code: sub(fix, cfc("PostCode"),           post_code)
-        sub(fix, cfc("City"), city or "UNKNOWN")
-        if subentity: sub(fix, cfc("CountrySubentity"),   subentity)
+    has_fix_fields = any([street, bldg, suite, floor_id, district,
+                          pob, post_code, city, subentity])
+    if has_fix_fields:
+        fix = sub(addr_el, sf("AddressFix"))       # AddressFix and children are in cfc/ns2
+        if street:    sub(fix, sf("Street"),             street)
+        if bldg:      sub(fix, sf("BuildingIdentifier"), bldg)
+        if suite:     sub(fix, sf("SuiteIdentifier"),    suite)
+        if floor_id:  sub(fix, sf("FloorIdentifier"),    floor_id)
+        if district:  sub(fix, sf("DistrictName"),       district)
+        if pob:       sub(fix, sf("POB"),                pob)
+        if post_code: sub(fix, sf("PostCode"),           post_code)
+        if city:      sub(fix, sf("City"),               city)
+        if subentity: sub(fix, sf("CountrySubentity"),   subentity)
         if addr_free:
-            sub(addr_el, cfc("AddressFree"), addr_free)
+            sub(addr_el, sf("AddressFree"), addr_free)
+    elif addr_free:
+        sub(addr_el, sf("AddressFree"), addr_free)
+    else:
+        sub(addr_el, sf("AddressFix"))
     return addr_el
 
 def build_person_name(parent, row):
-    """
-    NamePerson_Type — Section IIc, p.11-13.
-    nameType = Attribute. FirstName & LastName = Validation elements.
-    Child order: PrecedingTitle, Title, FirstName, MiddleName, NamePrefix,
-    LastName, GenerationIdentifier, Suffix, GeneralSuffix.
-    """
-    name_type  = safe(row.get("nametype"))
+    """NamePerson_Type — nameType attribute (lowercase, per OECD XSD NamePerson_Type)."""
+    name_type = safe(row.get("nametype"))
     attrib = {"nameType": name_type} if name_type else {}
-    name_el = ET.SubElement(parent, crs("Name"), attrib)
-
+    name_el = ET.SubElement(parent, tp("Name"), attrib)
     v = lambda k: safe(row.get(k))
-    if v("precedingtitle"):       sub(name_el, crs("PrecedingTitle"),       v("precedingtitle"))
-    if v("title"):                sub(name_el, crs("Title"),                v("title"))
-    sub(name_el, crs("FirstName"), v("firstname") or "NFN")
-    if v("middlename"):           sub(name_el, crs("MiddleName"),           v("middlename"))
-    if v("nameprefix"):           sub(name_el, crs("NamePrefix"),           v("nameprefix"))
-    sub(name_el, crs("LastName"), v("lastname") or "UNKNOWN")
-    if v("generationidentifier"): sub(name_el, crs("GenerationIdentifier"), v("generationidentifier"))
-    if v("suffix"):               sub(name_el, crs("Suffix"),               v("suffix"))
-    if v("generalsuffix"):        sub(name_el, crs("GeneralSuffix"),        v("generalsuffix"))
+    if v("precedingtitle"):       sub(name_el, sf("PrecedingTitle"),       v("precedingtitle"))
+    if v("title"):                sub(name_el, sf("Title"),                v("title"))
+    sub(name_el, sf("FirstName"), v("firstname") or "NFN")
+    if v("middlename"):           sub(name_el, sf("MiddleName"),           v("middlename"))
+    if v("nameprefix"):           sub(name_el, sf("NamePrefix"),           v("nameprefix"))
+    sub(name_el, sf("LastName"),  v("lastname") or "UNKNOWN")
+    if v("generationidentifier"): sub(name_el, sf("GenerationIdentifier"), v("generationidentifier"))
+    if v("suffix"):               sub(name_el, sf("Suffix"),               v("suffix"))
+    if v("generalsuffix"):        sub(name_el, sf("GeneralSuffix"),        v("generalsuffix"))
     return name_el
 
 def build_org_name(parent, row):
-    """Organisation Name — Section IIIc, p.16. nameType = Attribute."""
+    """Organisation Name — nameType attribute (lowercase, per OECD XSD NameOrganisation_Type)."""
     name_type = safe(row.get("nametype"))
     attrib = {"nameType": name_type} if name_type else {}
-    el = ET.SubElement(parent, crs("Name"), attrib)
+    el = ET.SubElement(parent, tp("Name"), attrib)
     el.text = safe(row.get("name")) or "UNKNOWN"
     return el
 
 def build_tin(parent, row):
-    """TIN — Section IIb, p.11. issuedBy = Attribute on TIN element."""
+    """TIN — issuedBy attribute (lowercase, per OECD XSD TIN_Type)."""
     tin_val   = safe(row.get("tin"))
     issued_by = safe(row.get("tin_issuedby"))
     if not tin_val:
         return None
     attrib = {"issuedBy": issued_by} if issued_by else {}
-    el = ET.SubElement(parent, crs("TIN"), attrib)
+    el = ET.SubElement(parent, tp("TIN"), attrib)
     el.text = tin_val
     return el
 
 def build_org_in(parent, row):
-    """Organisation IN — Section IIIb, p.16. issuedBy & INType = Attributes."""
+    """Organisation TIN — FC v2.2 uses TIN (not IN) for organisations; issuedBy attribute only."""
     in_val    = safe(row.get("in"))
     issued_by = safe(row.get("in_issuedby"))
-    in_type   = safe(row.get("in_intype"))
     if not in_val:
         return None
-    attrib = {}
-    if issued_by: attrib["issuedBy"] = issued_by
-    if in_type:   attrib["INType"]   = in_type
-    el = ET.SubElement(parent, crs("IN"), attrib)
+    attrib = {"issuedBy": issued_by} if issued_by else {}
+    el = ET.SubElement(parent, tp("TIN"), attrib)
     el.text = in_val
     return el
 
 def build_birth_info(parent, row):
-    """
-    BirthInfo — Section IIf, p.14-15.
-    Child elements: BirthDate, City, CitySubentity, CountryInfo.
-    """
+    """BirthInfo — FC v2.2 main namespace."""
     birth_date = fmt_date(safe(row.get("birthdate")))
     birth_city = safe(row.get("birthcity"))
     birth_sub  = safe(row.get("birthcitysubentity"))
@@ -298,21 +303,20 @@ def build_birth_info(parent, row):
 
     if not any([birth_date, birth_city, birth_cc, former_cc]):
         return None
-    el = sub(parent, crs("BirthInfo"))
-    if birth_date: sub(el, crs("BirthDate"),     birth_date)
-    if birth_city: sub(el, crs("City"),           birth_city)
-    if birth_sub:  sub(el, crs("CitySubentity"),  birth_sub)
+    el = sub(parent, tp("BirthInfo"))
+    if birth_date: sub(el, tp("BirthDate"),     birth_date)
+    if birth_city: sub(el, tp("City"),           birth_city)
+    if birth_sub:  sub(el, tp("CitySubentity"),  birth_sub)
     if birth_cc or former_cc:
-        ci = sub(el, crs("CountryInfo"))
-        if birth_cc:    sub(ci, crs("CountryCode"),      birth_cc)
-        elif former_cc: sub(ci, crs("FormerCountryName"), former_cc)
+        ci = sub(el, tp("CountryInfo"))
+        if birth_cc:    sub(ci, tp("CountryCode"),       birth_cc)
+        elif former_cc: sub(ci, tp("FormerCountryName"), former_cc)
     return el
 
 def build_account_number(parent, row):
     """
-    AccountNumber — Section IVd, p.18.
-    AcctNumberType, UndocumentedAccount, ClosedAccount, DormantAccount
-    are all ATTRIBUTES on AccountNumber element (not child elements).
+    AccountNumber — FC v2.2.
+    Attribute name: AcctNumberType (per OECD XSD FIAccountNumber_Type).
     """
     acc_num   = safe(row.get("accountnumber")) or "NANUM"
     acct_type = safe(row.get("acctnumbertype"))
@@ -321,152 +325,163 @@ def build_account_number(parent, row):
     dormant   = bool_attr(safe(row.get("dormantaccount")))
 
     attrib = {}
-    if acct_type:         attrib["AcctNumberType"]      = acct_type
-    if undoc   == "true": attrib["UndocumentedAccount"] = "true"
-    if closed  == "true": attrib["ClosedAccount"]       = "true"
-    if dormant == "true": attrib["DormantAccount"]      = "true"
+    if undoc   is not None: attrib["UndocumentedAccount"] = undoc
+    if closed  is not None: attrib["ClosedAccount"]       = closed
+    if dormant is not None: attrib["DormantAccount"]      = dormant
 
-    el = ET.SubElement(parent, crs("AccountNumber"), attrib)
+    el = ET.SubElement(parent, tp("AccountNumber"), attrib)
     el.text = acc_num
     return el
 
 def build_account_balance(parent, row):
-    """AccountBalance — Section IVg, p.22. currCode = Attribute."""
-    curr = safe(row.get("currcode")) or "USD"
-    el   = ET.SubElement(parent, crs("AccountBalance"), {"currCode": curr})
+    """AccountBalance — currCode attribute (lowercase, per OECD XSD MonAmnt_Type)."""
+    curr = safe(row.get("currcode")) or "XXX"
+    el   = ET.SubElement(parent, tp("AccountBalance"), {"currCode": curr})
     el.text = fmt_amount(safe(row.get("accountbalance")))
     return el
 
 def build_payment(parent, pmt_row):
-    """Payment — Section IVh, p.22-23. currCode = Attribute on PaymentAmnt."""
+    """
+    Payment — Type element + currCode attribute (lowercase), per OECD XSD Payment_Type.
+    """
     pmt_type = safe(pmt_row.get("type"))
     if not pmt_type:
         return None
-    curr    = safe(pmt_row.get("currcode")) or "USD"
-    pmt_el  = sub(parent, crs("Payment"))
-    sub(pmt_el, crs("Type"), pmt_type)
-    amnt_el = ET.SubElement(pmt_el, crs("PaymentAmnt"), {"currCode": curr})
+    curr    = safe(pmt_row.get("currcode")) or "XXX"
+    pmt_el  = sub(parent, tp("Payment"))
+    sub(pmt_el, tp("Type"), pmt_type)                                   # per XSD: element named Type
+    amnt_el = ET.SubElement(pmt_el, tp("PaymentAmnt"), {"currCode": curr})  # per XSD: attr currCode
     amnt_el.text = fmt_amount(safe(pmt_row.get("paymentamnt")))
     return pmt_el
 
 def build_controlling_person(parent, cp_row):
     """
-    ControllingPerson — Section IVf, p.21-22.
-    Order (schema diagram p.49): Individual -> CtrlgPersonType -> SelfCert.
+    ControllingPerson — FC v2.2.
+    Order: Individual → CtrlgPersonType.
+    SelfCert removed. CtrlgPersonType values: CRS801–CRS813 (was CRS800).
     """
-    cp_el  = sub(parent, crs("ControllingPerson"))
-    ind_el = sub(cp_el,  crs("Individual"))
+    cp_el  = sub(parent, tp("ControllingPerson"))
+    ind_el = sub(cp_el,  tp("Individual"))
 
     acc = safe(cp_row.get("accountnumber")) or "unknown account"
-    build_res_country(ind_el, cp_row, required=True,
+    build_res_country(ind_el, cp_row, required=False,
                       context=f"ControllingPerson for {acc}")
-
     build_tin(ind_el, cp_row)
     build_person_name(ind_el, cp_row)
     build_address(ind_el, cp_row, required=True,
                   context=f"ControllingPerson for {acc}")
     build_birth_info(ind_el, cp_row)
 
-    sub(cp_el, crs("CtrlgPersonType"), safe(cp_row.get("ctrlgpersontype")) or "CRS800")
-    sub(cp_el, crs("SelfCert"),        safe(cp_row.get("selfcert"))        or "CRS1000")
+    sub(cp_el, tp("CtrlgPersonType"), safe(cp_row.get("ctrlgpersontype")) or "CRS801")
     return cp_el
 
+def cp_has_data(cp_row):
+    return any(safe(cp_row.get(k)) for k in
+               ("rescountrycode", "firstname", "lastname",
+                "countrycode", "address_countrycode", "city", "addressfree"))
+
+def build_account_index(df):
+    idx = {}
+    if df.empty or "accountnumber" not in df.columns:
+        return idx
+    for i, row in df.iterrows():
+        key = safe(str(row.get("accountnumber")))
+        if key:
+            idx.setdefault(key, []).append((i, row_dict(row)))
+    return idx
+
 def get_linked(df, acc_num):
-    """Return rows from df where accountnumber matches acc_num."""
     if df.empty or not acc_num:
         return pd.DataFrame()
     return df[df["accountnumber"].astype(str).str.strip() == acc_num]
 
 # ── Section builders ───────────────────────────────────────────────────────────
 
-def build_message_spec(root, header_row, tc, part_num=1, total_parts=1):
+def build_message_header(root, header_row, tc, part_num=1, total_parts=1):
     """
-    MessageSpec — Section I, p.8-10.
-    Each split file gets a unique MessageRefId.
-    If splitting, Warning field notes the part.
+    MessageHeader — FC v2.2 (replaces MessageSpec).
+    MessageType is always "FATCA-CRS". CorrMessageRefId added (optional).
+    Element order: SendingCompanyIN, TransmittingCountry, ReceivingCountry,
+    MessageType, Warning, Contact, MessageRefId, MessageTypeIndic,
+    CorrMessageRefId, ReportingPeriod, Timestamp.
     """
-    msg = sub(root, crs("MessageSpec"))
+    hdr = sub(root, ft("MessageHeader"))
 
     sending_in = safe(header_row.get("sendingcompanyin"))
     if sending_in:
-        sub(msg, crs("SendingCompanyIN"), sending_in)
+        sub(hdr, tp("SendingCompanyIN"), sending_in)
 
     rc = safe(header_row.get("receivingcountry")) or "XX"
-    sub(msg, crs("TransmittingCountry"), tc)
-    sub(msg, crs("ReceivingCountry"),    rc)
-    sub(msg, crs("MessageType"),         "CRS")
+    sub(hdr, tp("TransmittingCountry"), tc)
+    sub(hdr, tp("ReceivingCountry"),    rc)
+    sub(hdr, tp("MessageType"),         "FATCA-CRS")
 
     warning = safe(header_row.get("warning")) or ""
     if total_parts > 1:
         warning = f"{warning} Split file {part_num} of {total_parts}.".strip()
     if warning:
-        sub(msg, crs("Warning"), warning)
+        sub(hdr, tp("Warning"), warning)
 
     contact = safe(header_row.get("contact"))
     if contact:
-        sub(msg, crs("Contact"), contact)
+        sub(hdr, tp("Contact"), contact)
 
     rep_period = safe(header_row.get("reportingperiod")) or datetime.now().strftime("%Y-%m-%d")
-    try:
-        year = pd.to_datetime(rep_period).strftime("%Y")
-    except Exception:
-        year = datetime.now().strftime("%Y")
 
-    # Always generate unique MessageRefId when splitting
     provided = safe(header_row.get("messagerefid"))
     if provided and total_parts == 1:
         msg_ref_id = provided
     else:
-        suffix     = f"P{part_num:02d}" if total_parts > 1 else ""
-        msg_ref_id = f"{tc}{year}{rc}{suffix}{uuid.uuid4().hex[:6].upper()}"
+        suffix = f"P{part_num:02d}" if total_parts > 1 else ""
+        msg_ref_id = f"{tc}{sending_in or ''}{uuid.uuid4().hex[:12].upper()}{suffix}"
 
-    sub(msg, crs("MessageRefId"),    msg_ref_id)
-    sub(msg, crs("MessageTypeIndic"), safe(header_row.get("messagetypeindic")) or "CRS701")
-    corr_msg = safe(header_row.get("corrmessagerefid"))
-    if corr_msg:
-        sub(msg, crs("CorrMessageRefId"), corr_msg)
-    sub(msg, crs("ReportingPeriod"), fmt_date(rep_period) or rep_period)
-    sub(msg, crs("Timestamp"),       datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"))
-    return msg
+    sub(hdr, tp("MessageRefId"),     msg_ref_id)
+    sub(hdr, tp("MessageTypeIndic"), safe(header_row.get("messagetypeindic")) or "CRS701")
 
-def build_reporting_fi(crs_body, fi_row, tc):
+    corr_msg_ref = safe(header_row.get("corrmessagerefid"))
+    if corr_msg_ref:
+        sub(hdr, tp("CorrMessageRefId"), corr_msg_ref)
+
+    sub(hdr, tp("ReportingPeriod"), fmt_date(rep_period) or rep_period)
+    timestamp = safe(header_row.get("timestamp"))
+    if not timestamp:
+        timestamp = datetime.now().isoformat(timespec="seconds")
+    sub(hdr, tp("Timestamp"), timestamp)
+    return hdr
+
+def build_reporting_fi(body, fi_row, tc, sending_in=None):
     """
-    ReportingFI — Section IVa, p.17.
-    Order: ResCountryCode -> IN -> Name -> Address -> DocSpec.
-    CRS v3.0 defines ReportingFI as CorrectableOrganisationParty_Type, which
-    extends OrganisationParty_Type by appending DocSpec.
+    ReportingFI — FC v2.2.
+    Goes directly inside MessageBody (no CrsBody wrapper).
+    Order: ResCountryCode → IN → Name → Address → DocSpec.
     """
-    fi_el = sub(crs_body, crs("ReportingFI"))
+    fi_el = sub(body, tp("ReportingFI"))
     build_res_country(fi_el, fi_row, required=False)
     build_org_in(fi_el, fi_row)
     build_org_name(fi_el, fi_row)
     build_address(fi_el, fi_row, required=True, context="ReportingFI")
     build_doc_spec(fi_el,
                    safe(fi_row.get("doctypeindic"))  or "OECD1",
-                   safe(fi_row.get("docrefid"))      or uid(tc),
-                   safe(fi_row.get("corrmessagerefid")),
+                   safe(fi_row.get("docrefid"))      or make_doc_ref(tc, sending_in),
                    safe(fi_row.get("corrdocrefid")))
     return fi_el
 
-def build_individual_account(rg_el, rd, cp_df, pmt_df, tc):
+def build_individual_account(rg_el, rd, cp_idx, pmt_idx, tc, sending_in=None):
     """
-    Individual Account Report — Section IVc, p.17.
-    AccountHolder order (IVe, p.19): EquityInterestType -> SelfCert -> Individual.
+    Individual AccountReport — FC v2.2.
+    Removed: EquityInterestType, SelfCert, DDProcedure, AccountType, JointAccount.
+    AccountHolder contains only Individual (no AcctHolderType for individuals).
+    ControllingPerson placed after AccountHolder, before AccountBalance.
     """
-    ar_el = sub(rg_el, crs("AccountReport"))
+    ar_el = sub(rg_el, tp("AccountReport"))
     build_doc_spec(ar_el,
                    safe(rd.get("doctypeindic"))  or "OECD1",
-                   safe(rd.get("docrefid"))      or uid(tc),
-                   safe(rd.get("corrmessagerefid")),
+                   safe(rd.get("docrefid"))      or make_doc_ref(tc, sending_in),
                    safe(rd.get("corrdocrefid")))
     build_account_number(ar_el, rd)
 
-    ah_el = sub(ar_el, crs("AccountHolder"))
-    equity = safe(rd.get("equityinteresttype"))
-    if equity: sub(ah_el, crs("EquityInterestType"), equity)
-    sub(ah_el, crs("SelfCert"), safe(rd.get("selfcert")) or "CRS900")
-
-    ind_el = sub(ah_el, crs("Individual"))
+    ah_el  = sub(ar_el, tp("AccountHolder"))
+    ind_el = sub(ah_el, tp("Individual"))
     build_res_country(ind_el, rd, required=True,
                       context=f"Individual account {safe(rd.get('accountnumber')) or 'unknown'}")
     build_tin(ind_el, rd)
@@ -476,78 +491,55 @@ def build_individual_account(rg_el, rd, cp_df, pmt_df, tc):
     build_birth_info(ind_el, rd)
 
     acc_num = safe(rd.get("accountnumber"))
-    for _, cp_row in get_linked(cp_df, acc_num).iterrows():
-        build_controlling_person(ar_el, row_dict(cp_row))
+    for _, cp_row in cp_idx.get(acc_num, []):
+        if cp_has_data(cp_row):
+            build_controlling_person(ar_el, cp_row)
 
     build_account_balance(ar_el, rd)
 
-    for _, pmt_row in get_linked(pmt_df, acc_num).iterrows():
-        build_payment(ar_el, row_dict(pmt_row))
+    for _, pmt_row in pmt_idx.get(acc_num, []):
+        build_payment(ar_el, pmt_row)
 
-    sub(ar_el, crs("DDProcedure"), safe(rd.get("ddprocedure"))  or "CRS1200")
-    sub(ar_el, crs("AccountType"), safe(rd.get("accounttype"))  or "CRS1100")
-
-    joint = safe(rd.get("jointaccount"))
-    if joint and joint.lower() == "true":
-        ja = sub(ar_el, crs("JointAccount"))
-        sub(ja, crs("Number"), safe(rd.get("jointaccount_number")) or "1")
-
-def build_organisation_account(rg_el, rd, cp_df, pmt_df, tc):
+def build_organisation_account(rg_el, rd, cp_idx, pmt_idx, tc, sending_in=None):
     """
-    Organisation Account Report — Section IVc, p.17.
-    AccountHolder order (IVe, p.19-20):
-        EquityInterestType -> SelfCert -> Organisation -> AcctHolderType.
+    Organisation AccountReport — FC v2.2.
+    Removed: EquityInterestType, SelfCert, DDProcedure, AccountType, JointAccount.
+    AcctHolderType → AcctHolderTypeCRS (sibling of Organisation in AccountHolder).
     """
-    ar_el = sub(rg_el, crs("AccountReport"))
+    ar_el = sub(rg_el, tp("AccountReport"))
     build_doc_spec(ar_el,
                    safe(rd.get("doctypeindic"))  or "OECD1",
-                   safe(rd.get("docrefid"))      or uid(tc),
-                   safe(rd.get("corrmessagerefid")),
+                   safe(rd.get("docrefid"))      or make_doc_ref(tc, sending_in),
                    safe(rd.get("corrdocrefid")))
     build_account_number(ar_el, rd)
 
-    ah_el = sub(ar_el, crs("AccountHolder"))
-    equity = safe(rd.get("equityinteresttype"))
-    if equity: sub(ah_el, crs("EquityInterestType"), equity)
-    sub(ah_el, crs("SelfCert"), safe(rd.get("selfcert")) or "CRS900")
-
-    org_el = sub(ah_el, crs("Organisation"))
+    ah_el  = sub(ar_el, tp("AccountHolder"))
+    org_el = sub(ah_el, tp("Organisation"))
     build_res_country(org_el, rd, required=False)
     build_org_in(org_el, rd)
     build_org_name(org_el, rd)
-    build_address(org_el, rd, required=True,
-                  context=f"Organisation account {safe(rd.get('accountnumber')) or 'unknown'}")
+    build_address(org_el, rd, required=False,
+                  context=f"Organisation account {safe(rd.get('accountnumber')) or 'unknown'}",
+                  force=True)
 
-    sub(ah_el, crs("AcctHolderType"), safe(rd.get("acctholdertype")) or "CRS102")
+    acct_holder_type = safe(rd.get("acctholdertype"))
+    if acct_holder_type:
+        sub(ah_el, tp("AcctHolderTypeCRS"), acct_holder_type)
 
     acc_num = safe(rd.get("accountnumber"))
-    for _, cp_row in get_linked(cp_df, acc_num).iterrows():
-        build_controlling_person(ar_el, row_dict(cp_row))
+    for _, cp_row in cp_idx.get(acc_num, []):
+        if cp_has_data(cp_row):
+            build_controlling_person(ar_el, cp_row)
 
     build_account_balance(ar_el, rd)
 
-    for _, pmt_row in get_linked(pmt_df, acc_num).iterrows():
-        build_payment(ar_el, row_dict(pmt_row))
-
-    sub(ar_el, crs("DDProcedure"), safe(rd.get("ddprocedure"))  or "CRS1200")
-    sub(ar_el, crs("AccountType"), safe(rd.get("accounttype"))  or "CRS1100")
-
-    joint = safe(rd.get("jointaccount"))
-    if joint and joint.lower() == "true":
-        ja = sub(ar_el, crs("JointAccount"))
-        sub(ja, crs("Number"), safe(rd.get("jointaccount_number")) or "1")
+    for _, pmt_row in pmt_idx.get(acc_num, []):
+        build_payment(ar_el, pmt_row)
 
 # ── Excel filepath column writer ───────────────────────────────────────────────
 
 def write_filepath_column(input_path, output_excel_path,
                           ind_map, org_map, cp_map, pmt_map):
-    """
-    Copy input Excel to output_excel_path and add a 'filepath' column
-    to each account sheet showing which XML file each data row belongs to.
-
-    Maps are {0-based data row index: xml_filepath_string}.
-    Data rows start at Excel row DATA_START_ROW (row 8).
-    """
     shutil.copy2(input_path, output_excel_path)
     wb = openpyxl.load_workbook(output_excel_path)
 
@@ -570,18 +562,23 @@ def write_filepath_column(input_path, output_excel_path,
         new_col = ws.max_column + 1
         col_ltr = get_column_letter(new_col)
 
-        # Header
-        hdr = ws.cell(row=1, column=new_col, value="filepath")
+        field_row = 1
+        for row_num in range(1, min(ws.max_row, 10) + 1):
+            val = ws.cell(row=row_num, column=1).value
+            if val is not None and str(val).strip().lower().startswith("field"):
+                field_row = row_num
+                break
+        data_start_row = field_row + 1 + REMARK_ROWS
+
+        hdr = ws.cell(row=field_row, column=new_col, value="filepath")
         hdr.fill = hdr_fill
         hdr.font = hdr_font
 
-        # Blank remark rows 2-7
-        for rr in range(2, DATA_START_ROW):
+        for rr in range(field_row + 1, data_start_row):
             ws.cell(row=rr, column=new_col, value="")
 
-        # Filepath per data row
         for data_idx, filepath in fp_map.items():
-            excel_row = DATA_START_ROW + data_idx
+            excel_row = data_start_row + data_idx
             c = ws.cell(row=excel_row, column=new_col, value=filepath)
             c.fill = fp_fill
             c.font = fp_font
@@ -594,12 +591,12 @@ def write_filepath_column(input_path, output_excel_path,
 
 def convert(input_path, n_splits=1, output_prefix=None):
     print(f"\n{'='*60}")
-    print(f"  CRS Excel to XML Converter v3.0")
+    print(f"  FC XML Schema v2.2 Converter")
     print(f"{'='*60}")
     print(f"  Input  : {input_path}")
     print(f"  Splits : {n_splits}")
 
-    xl = pd.read_excel(input_path, sheet_name=None, dtype=str, header=0)
+    xl = pd.read_excel(input_path, sheet_name=None, dtype=str, header=0, keep_default_na=False)
 
     header_df = read_sheet(xl, "MessageHeader")
     fi_df     = read_sheet(xl, "ReportingFI")
@@ -612,25 +609,43 @@ def convert(input_path, n_splits=1, output_prefix=None):
         raise ValueError("MessageHeader sheet is missing or has no data rows.")
 
     header_row = row_dict(header_df.iloc[0])
-    tc  = safe(header_row.get("transmittingcountry")) or "MY"
-    mti = safe(header_row.get("messagetypeindic"))    or "CRS701"
+    tc         = safe(header_row.get("transmittingcountry")) or "MY"
+    mti        = safe(header_row.get("messagetypeindic"))    or "CRS701"
+    sending_in = safe(header_row.get("sendingcompanyin"))
 
-    # Output paths
-    base    = Path(input_path).stem if output_prefix is None else output_prefix
-    out_dir = Path(input_path).parent
+    base    = Path(input_path).stem
+    in_dir  = Path(input_path).parent
+    if output_prefix is None:
+        out_dir = in_dir
+    elif "/" in output_prefix or output_prefix.endswith(os.sep):
+        out_dir = Path(output_prefix)
+        out_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        out_dir = in_dir / output_prefix
+        out_dir.mkdir(parents=True, exist_ok=True)
 
     def xml_path(part, total):
         if total == 1:
             return str(out_dir / f"{base}_CRS.xml")
         return str(out_dir / f"{base}_CRS_part{part:02d}.xml")
 
-    excel_out = str(out_dir / f"{base}_with_filepath.xlsx")
+    excel_out = str(in_dir / f"{base}_with_filepath.xlsx")
 
     # ── Nil return ─────────────────────────────────────────────────────────────
     if mti == "CRS703":
-        print("  Mode   : Nil return (CRS703) — CrsBody omitted")
-        root = ET.Element(crs("CRS_OECD"), {"version": "3.0"})
-        build_message_spec(root, header_row, tc)
+        print("  Mode   : Nil return (CRS703)")
+        if fi_df.empty:
+            raise ValueError("ReportingFI sheet is missing or has no data rows.")
+        fi_row = row_dict(fi_df.iloc[0])
+        root   = ET.Element(ft("FATCA_CRS"), {"version": "2.2"})
+        build_message_header(root, header_row, tc)
+        body   = sub(root, ft("MessageBody"))
+        build_reporting_fi(body, fi_row, tc, sending_in)
+        rg_el  = sub(body, tp("ReportingGroup"))
+        nil_el = sub(rg_el, tp("NilReport"))
+        build_doc_spec(nil_el,
+                       safe(fi_row.get("doctypeindic")) or "OECD1",
+                       safe(fi_row.get("docrefid")) or make_doc_ref(tc, sending_in))
         op = xml_path(1, 1)
         write_xml(root, op)
         print(f"\n  ✅  {op}")
@@ -640,7 +655,20 @@ def convert(input_path, n_splits=1, output_prefix=None):
         raise ValueError("ReportingFI sheet is missing or has no data rows.")
     fi_row = row_dict(fi_df.iloc[0])
 
-    # ── Tag account rows with source sheet and original index ──────────────────
+    # ── Filter excluded jurisdictions ──────────────────────────────────────────
+    excluded = read_excluded_jurisdictions(xl)
+    if excluded and not ind_df.empty and "rescountrycode" in ind_df.columns:
+        before = len(ind_df)
+        ind_df = ind_df[~ind_df["rescountrycode"].str.upper().isin(excluded)].reset_index(drop=True)
+        if len(ind_df) < before:
+            print(f"  Filtered: {before - len(ind_df)} Individual row(s) excluded")
+    if excluded and not org_df.empty and "rescountrycode" in org_df.columns:
+        before = len(org_df)
+        org_df = org_df[~org_df["rescountrycode"].str.upper().isin(excluded)].reset_index(drop=True)
+        if len(org_df) < before:
+            print(f"  Filtered: {before - len(org_df)} Organisation row(s) excluded")
+
+    # ── Tag account rows ───────────────────────────────────────────────────────
     ind_tagged = ind_df.copy()
     ind_tagged["__sheet__"]    = "Individual"
     ind_tagged["__orig_idx__"] = range(len(ind_tagged))
@@ -655,7 +683,6 @@ def convert(input_path, n_splits=1, output_prefix=None):
     if total_accounts == 0:
         raise ValueError("No account rows found in Individual or Organisation sheets.")
 
-    # Cap splits to available rows
     actual_splits = min(n_splits, total_accounts)
     if actual_splits < n_splits:
         print(f"  ⚠️   Only {total_accounts} account(s) — reducing to {actual_splits} file(s).")
@@ -666,7 +693,9 @@ def convert(input_path, n_splits=1, output_prefix=None):
     print(f"  Accounts: {total_accounts} rows → {total_parts} file(s)")
     print(f"{'='*60}\n")
 
-    # Maps: {0-based data row index in original df -> xml filepath}
+    cp_idx  = build_account_index(cp_df)
+    pmt_idx = build_account_index(pmt_df)
+
     ind_map = {}
     org_map = {}
     cp_map  = {}
@@ -676,13 +705,13 @@ def convert(input_path, n_splits=1, output_prefix=None):
     # ── One XML per chunk ──────────────────────────────────────────────────────
     for part_num, chunk in enumerate(chunks, start=1):
         op   = xml_path(part_num, total_parts)
-        root = ET.Element(crs("CRS_OECD"), {"version": "3.0"})
+        root = ET.Element(ft("FATCA_CRS"), {"version": "2.2"})
 
-        build_message_spec(root, header_row, tc, part_num, total_parts)
+        build_message_header(root, header_row, tc, part_num, total_parts)
 
-        crs_body = sub(root, crs("CrsBody"))
-        build_reporting_fi(crs_body, fi_row, tc)
-        rg_el = sub(crs_body, crs("ReportingGroup"))
+        body  = sub(root, ft("MessageBody"))
+        build_reporting_fi(body, fi_row, tc, sending_in)
+        rg_el = sub(body, tp("ReportingGroup"))
 
         for _, row in chunk.iterrows():
             rd       = row_dict(row)
@@ -694,21 +723,16 @@ def convert(input_path, n_splits=1, output_prefix=None):
                 continue
 
             if sheet == "Individual":
-                build_individual_account(rg_el, rd, cp_df, pmt_df, tc)
+                build_individual_account(rg_el, rd, cp_idx, pmt_idx, tc, sending_in)
                 ind_map[orig_idx] = op
             elif sheet == "Organisation":
-                build_organisation_account(rg_el, rd, cp_df, pmt_df, tc)
+                build_organisation_account(rg_el, rd, cp_idx, pmt_idx, tc, sending_in)
                 org_map[orig_idx] = op
 
-            # ControllingPerson rows travel with their parent account
-            for ci, cp_row in cp_df.iterrows():
-                if safe(str(cp_row.get("accountnumber"))) == acc_num:
-                    cp_map[ci] = op
-
-            # Payment rows travel with their parent account
-            for pi, pmt_row in pmt_df.iterrows():
-                if safe(str(pmt_row.get("accountnumber"))) == acc_num:
-                    pmt_map[pi] = op
+            for ci, _ in cp_idx.get(acc_num, []):
+                cp_map[ci] = op
+            for pi, _ in pmt_idx.get(acc_num, []):
+                pmt_map[pi] = op
 
         write_xml(root, op)
         print(f"  Part {part_num:02d}/{total_parts:02d} "
@@ -729,7 +753,7 @@ def convert(input_path, n_splits=1, output_prefix=None):
 # ── CLI ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="CRS Excel to XML Converter v3.0",
+        description="FC XML Schema v2.2 Excel to XML Converter",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
@@ -739,8 +763,8 @@ if __name__ == "__main__":
                         metavar="N",
                         help="Number of XML files to split into (default: 1)")
     parser.add_argument("--out", "-o", default=None,
-                        metavar="PREFIX",
-                        help="Output filename prefix (default: input filename stem)")
+                        metavar="FOLDER",
+                        help="Output folder for XML files (created if missing).")
     args = parser.parse_args()
 
     if args.split < 1:
