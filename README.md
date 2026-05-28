@@ -14,6 +14,19 @@ For large submissions, the output can be split into multiple XML files with bala
 
 ---
 
+## Data Files
+
+Excel data files are not stored in this repository. They are available on SharePoint:
+
+> **[CRS Data Files — SharePoint](YOUR_SHAREPOINT_LINK_HERE)**
+
+| File | Description |
+|------|-------------|
+| `CRS_20260528.xlsx` | CRS submission data |
+| `CRS_20260528_v2.xlsx` | CRS submission data (revised) |
+
+---
+
 ## Prerequisites
 
 - Python 3.8+
