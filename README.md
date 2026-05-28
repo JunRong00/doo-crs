@@ -1,22 +1,54 @@
 # CRS Excel-to-XML Converter
 
-Converts a filled CRS template Excel file into one or more **FC XML Schema v2.2** files for submission to the **Vanuatu MDES portal** (Ministry of Finance, Vanuatu).
+Converts a filled CRS template Excel file into **FC XML Schema v2.2** files for submission to the **Vanuatu MDES portal** (Ministry of Finance, Vanuatu).
 
-The converter follows the CRS (Common Reporting Standard) data model defined in the OECD Amended CRS XML Schema User Guide v4.0 (October 2024), wrapped in the FC v2.2 envelope format required by the MDES portal.
+**Authors:** Kevin Mun (SH) · Jareld Lim (JR)
 
 ---
 
-## What This Does
+## Table of Contents
 
-The Vanuatu MDES portal requires CRS reporting in **FC XML Schema v2.2** format. This converter reads your CRS data from a structured Excel template and produces valid FC v2.2 XML files ready for upload.
+1. [Overview](#overview)
+2. [Quick Start](#quick-start)
+3. [Data Files](#data-files)
+4. [Prerequisites](#prerequisites)
+5. [Repository Structure](#repository-structure)
+6. [Template Structure](#template-structure)
+7. [Usage](#usage)
+8. [Outputs](#outputs)
+9. [Submission Workflow](#submission-workflow)
+10. [Technical Reference](#technical-reference)
+11. [Key Notes](#key-notes)
 
-For large submissions, the output can be split into multiple XML files with balanced row counts.
+---
+
+## Overview
+
+The Vanuatu MDES portal requires CRS (Common Reporting Standard) reporting in **FC XML Schema v2.2** format. This converter reads CRS data from a structured Excel template and produces valid FC v2.2 XML files ready for upload.
+
+- For large submissions, output can be split into multiple balanced XML files
+- Each file gets a unique `MessageRefId`
+- A copy of the Excel is produced showing which XML file each row was written to
+
+> **Reference:** OECD Amended CRS XML Schema User Guide v4.0, October 2024
+
+---
+
+## Quick Start
+
+```bash
+# Single XML file
+/opt/anaconda3/bin/python xlsx_to_xml_converter.py YourFile.xlsx
+
+# Split into 50 XML files, saved to output_xml/
+/opt/anaconda3/bin/python xlsx_to_xml_converter.py YourFile.xlsx --split 50 --out output_xml
+```
 
 ---
 
 ## Data Files
 
-Excel data files are not stored in this repository. They are available on SharePoint:
+Excel data files are not stored in this repository due to sensitive financial data. They are available on SharePoint:
 
 > **[CRS Data Files — SharePoint](YOUR_SHAREPOINT_LINK_HERE)**
 
@@ -59,7 +91,7 @@ CRS/
         └── isocrstypes_v1.1.xsd
 ```
 
-> **Note:** Excel data files (`.xlsx`) and generated output folders (`output_xml*/`) are excluded from version control via `.gitignore`.
+> Excel data files (`.xlsx`) and generated output folders (`output_xml*/`) are excluded from version control.
 
 ---
 
@@ -125,14 +157,30 @@ Arguments:
 
 ## Outputs
 
-1. **XML file(s)** — One or more FC XML Schema v2.2 files ready for upload to the Vanuatu MDES portal.
-2. **Excel with filepath column** — A copy of the input Excel with a `filepath` column added to `Individual`, `Organisation`, `ControllingPerson`, and `Payment` sheets, showing which XML file each row was written to.
+| Output | Description |
+|--------|-------------|
+| `YourFile_CRS.xml` (or `_part01.xml` etc.) | FC v2.2 XML file(s) ready for MDES portal upload |
+| `YourFile_with_filepath.xlsx` | Copy of input Excel with `filepath` column showing which XML file each row belongs to |
 
 ---
 
-## XML Namespace Structure
+## Submission Workflow
 
-The generated XML uses three namespaces as required by the MDES portal:
+1. **Fill in the Excel template** with CRS data across all 6 sheets
+2. **Run the converter** to generate XML files
+3. **Review the `_with_filepath.xlsx`** to verify all rows were processed
+4. **Log in to the Vanuatu MDES portal** at [https://mdes.doft.gov.vu/MDES/](https://mdes.doft.gov.vu/MDES/)
+5. **Upload each XML file** one at a time
+6. **Review portal warnings** — incomplete `AddressFix` fields (Street, BuildingIdentifier, PostCode, City) will be flagged for Competent Authority review but do not block submission
+7. **Click Next** to confirm the upload
+
+> For large datasets, split into 50 files and upload each part separately.
+
+---
+
+## Technical Reference
+
+### XML Namespace Structure
 
 | Prefix | Namespace URI | Used for |
 |--------|--------------|---------|
@@ -140,20 +188,15 @@ The generated XML uses three namespaces as required by the MDES portal:
 | `ns1` | `urn:oecd:ties:fatcacrstypes:v2` | All main content elements |
 | `ns2` | `urn:oecd:ties:stffatcatypes:v2` | Address children and Name children |
 
----
+### MessageRefId Format
 
-## MessageRefId Format
-
-Each XML file is assigned a unique `MessageRefId` generated as:
+Each XML file is assigned a unique `MessageRefId`:
 
 ```
 {TransmittingCountry}2025{SendingCompanyIN}{12-char random hex}{part suffix}
 ```
 
-Example (split file 1 of 50):
-```
-VU2025562188A3F9C12D4E8BP01
-```
+Example — split file 1 of 50: `VU2025562188A3F9C12D4E8BP01`
 
 | Part | Example | Source |
 |------|---------|--------|
@@ -163,21 +206,15 @@ VU2025562188A3F9C12D4E8BP01
 | `A3F9C12D4E8B` | 12-char random hex | Auto-generated |
 | `P01` | Part number | Only added when splitting |
 
-If a `MessageRefId` is provided in the Excel and splitting is not used, the provided value is used as-is.
+### Splitting Logic
 
----
+- Splitting unit = account rows (`Individual` + `Organisation` combined)
+- Rows distributed using ceiling division — no file has more than one extra row
+- Each split file gets a unique `MessageRefId`
+- The `ReportingFI` block is replicated in every split file
+- `ControllingPerson` and `Payment` rows follow their parent account
 
-## Splitting Logic
-
-- Splitting unit = account rows (`Individual` + `Organisation` combined).
-- Rows are distributed using ceiling division — no file has more than one extra row compared to any other.
-- Each split file gets a unique `MessageRefId`.
-- The `ReportingFI` block is replicated in every split file.
-- `ControllingPerson` and `Payment` rows follow their parent account into the same split file.
-
----
-
-## Nil Return
+### Nil Return
 
 Set `MessageTypeIndic` to `CRS703` in the `MessageHeader` sheet to generate a nil-return XML.
 
@@ -185,7 +222,7 @@ Set `MessageTypeIndic` to `CRS703` in the `MessageHeader` sheet to generate a ni
 
 ## Key Notes
 
-- In FC v2.2, both Individual and Organisation accounts use `TIN` for identification numbers (`IN` is not used).
-- `AcctNumberType` attribute is not supported in FC v2.2 and is omitted from `AccountNumber`.
-- `AddressFix` is preferred over `AddressFree` per MDES portal guidance. Submissions with empty `AddressFix` fields (Street, BuildingIdentifier, PostCode, City) may be flagged for review by the Competent Authority.
-- Reference spec: OECD Amended CRS XML Schema User Guide v4.0, October 2024 (`reference/Amended Common Reporting Standard XML Schema.pdf`).
+- In FC v2.2, both Individual and Organisation accounts use `TIN` for identification numbers (`IN` is not used)
+- `AcctNumberType` attribute is omitted from `AccountNumber` (not supported in FC v2.2)
+- `AddressFix` is preferred over `AddressFree` per MDES portal guidance
+- The converter is built against the OECD CRS XML Schema v3.0 data model, wrapped in the FC v2.2 envelope required by the Vanuatu MDES portal
