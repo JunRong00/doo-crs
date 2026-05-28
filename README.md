@@ -32,16 +32,18 @@ pip install pandas openpyxl
 
 ```
 CRS/
-├── xlsx_to_xml_converter.py   # Main converter script
-├── README.md                  # This file
-├── CLAUDE.md                  # Project notes for Claude Code
-├── dd7ee57a-en.pdf            # Reference: OECD CRS XML Schema User Guide v4.0 (Oct 2024)
-└── xml-schema-crs/            # Reference: CRS XML Schema v3.0 XSD files
-    ├── CrsXML_v3.0.xsd
-    ├── oecdcrstypes_v5.0.xsd
-    ├── CommonTypesFatcaCrs_v2.0.xsd
-    ├── FatcaTypes_v1.2.xsd
-    └── isocrstypes_v1.1.xsd
+├── xlsx_to_xml_converter.py       # Main converter script
+├── README.md                      # This file
+├── CLAUDE.md                      # Project notes for Claude Code
+├── .gitignore
+└── reference/                     # Reference documents (do not modify)
+    ├── Amended Common Reporting Standard XML Schema.pdf
+    └── xml-schema-crs/            # CRS XML Schema v3.0 XSD files
+        ├── CrsXML_v3.0.xsd
+        ├── oecdcrstypes_v5.0.xsd
+        ├── CommonTypesFatcaCrs_v2.0.xsd
+        ├── FatcaTypes_v1.2.xsd
+        └── isocrstypes_v1.1.xsd
 ```
 
 > **Note:** Excel data files (`.xlsx`) and generated output folders (`output_xml*/`) are excluded from version control via `.gitignore`.
@@ -173,4 +175,4 @@ Set `MessageTypeIndic` to `CRS703` in the `MessageHeader` sheet to generate a ni
 - In FC v2.2, both Individual and Organisation accounts use `TIN` for identification numbers (`IN` is not used).
 - `AcctNumberType` attribute is not supported in FC v2.2 and is omitted from `AccountNumber`.
 - `AddressFix` is preferred over `AddressFree` per MDES portal guidance. Submissions with empty `AddressFix` fields (Street, BuildingIdentifier, PostCode, City) may be flagged for review by the Competent Authority.
-- Reference spec: OECD Amended CRS XML Schema User Guide v4.0, October 2024 (`dd7ee57a-en.pdf`).
+- Reference spec: OECD Amended CRS XML Schema User Guide v4.0, October 2024 (`reference/Amended Common Reporting Standard XML Schema.pdf`).

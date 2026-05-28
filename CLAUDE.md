@@ -2,20 +2,26 @@
 
 ## Python Environment
 
-Always use `/opt/anaconda3/bin/python` on this machine — it has `pandas` and `openpyxl` installed. The default `python` command uses the `vqa` conda env which lacks `pandas`.
+Always use `/opt/anaconda3/bin/python` on this machine — it has `pandas` and `openpyxl` installed.
 
 ```bash
-/opt/anaconda3/bin/python xlsx_to_xml_converter.py CRS_Template_Revised_2.xlsx
+/opt/anaconda3/bin/python xlsx_to_xml_converter.py YourFile.xlsx --split 50 --out output_xml
 ```
 
 ---
 
 ## Project Overview
 
-This project converts a CRS (Common Reporting Standard) Excel template into CRS XML Schema v3.0 files for submission to tax authorities.
+Converts a CRS (Common Reporting Standard) Excel template into **FC XML Schema v2.2** files for submission to the **Vanuatu MDES portal**.
 
-**Reference spec:** OECD Amended CRS XML Schema User Guide v4.0, October 2024 (`doi:10.1787/dd7ee57a-en`)  
-**Schema version:** CRS v3.0
+**Reference files (local only — do NOT fetch external specs):**
+1. `reference/Amended Common Reporting Standard XML Schema.pdf` — OECD CRS XML Schema User Guide v4.0 (Oct 2024)
+2. `reference/xml-schema-crs/` — CRS v3.0 XSD files:
+   - `CrsXML_v3.0.xsd`
+   - `oecdcrstypes_v5.0.xsd`
+   - `CommonTypesFatcaCrs_v2.0.xsd`
+   - `FatcaTypes_v1.2.xsd`
+   - `isocrstypes_v1.1.xsd`
 
 ---
 
@@ -23,11 +29,8 @@ This project converts a CRS (Common Reporting Standard) Excel template into CRS 
 
 | File | Purpose |
 |------|---------|
-| `xlsx_to_xml_converter.py` | Main converter (719 lines) |
-| `fill_dummy_data.py` | Test data generator |
-| `CRS_Template_Revised_2.xlsx` | Blank data entry template |
-| `CRS_Template_Dummy.xlsx` | Pre-filled sample (output of fill_dummy_data.py) |
-| `CRS_Template_Dummy_CRS.xml` | Sample XML output for reference |
+| `xlsx_to_xml_converter.py` | Main converter |
+| `reference/` | Reference PDF and XSD files (read-only) |
 
 ---
 
@@ -42,41 +45,58 @@ This project converts a CRS (Common Reporting Standard) Excel template into CRS 
 
 ---
 
-## XML Namespaces (Appendix B, p.58 of spec)
+## XML Namespaces (FC v2.2 — portal requirement)
 
 ```python
-NS = {
-    "crs": "urn:oecd:ties:crs:v3",
-    "stf": "urn:oecd:ties:crsstf:v5",
-    "cfc": "urn:oecd:ties:commontypesfatcacrs:v2",
-    "iso": "urn:oecd:ties:isocrstypes:v1",
-}
+NS_MAIN  = "urn:fatcacrs:ties:v2"            # ns0 — wrapper only
+NS_TYPES = "urn:oecd:ties:fatcacrstypes:v2"  # ns1 — main content elements
+NS_STF   = "urn:oecd:ties:stffatcatypes:v2"  # ns2 — Address children + Name children
 ```
+
+These namespace URIs were discovered through portal validation errors. They are NOT in the local reference files (which describe CRS v3.0).
+
+---
+
+## FC v2.2 vs CRS v3.0 Differences
+
+| Feature | CRS v3.0 (reference files) | FC v2.2 (portal requirement) |
+|---------|---------------------------|-------------------------------|
+| Root element | `CRS_OECD version="3.0"` | `FATCA_CRS version="2.2"` |
+| Message wrapper | `MessageSpec` / `CrsBody` | `MessageHeader` / `MessageBody` |
+| MessageType | `"CRS"` | `"FATCA-CRS"` |
+| Org identifier | `IN` element | `TIN` element |
+| AcctNumberType | Attribute on AccountNumber | Not allowed in FC v2.2 |
+| Address children ns | `commontypesfatcacrs:v2` | `stffatcatypes:v2` |
+| Name children ns | main CRS namespace | `stffatcatypes:v2` |
+
+---
+
+## MessageRefId Format
+
+```
+{TransmittingCountry}2025{SendingCompanyIN}{12-char random hex}{Pxx if split}
+```
+
+Example: `VU2025562188A3F9C12D4E8BP01`
 
 ---
 
 ## Critical Schema Rules
 
-### SelfCert Enum Types (two different enums — easy to confuse)
+### AccountHolder Element Order
 
-| Context | Enum Type | Values |
-|---------|-----------|--------|
-| AccountHolder (Individual/Organisation) | `CrsSelfCert_EnumType` | CRS901=true, CRS902=false, CRS900=not reported |
-| ControllingPerson | `CrsSelfCertforCtrlgPerson_EnumType` | CRS1001=true, CRS1002=false, CRS1000=not reported |
-
-Using CRS901 for ControllingPerson is a schema violation.
+Individual: `Individual` only (no SelfCert, EquityInterestType in FC v2.2)
+Organisation: `Organisation` → `AcctHolderTypeCRS`
+ControllingPerson: `Individual` → `CtrlgPersonType`
 
 ### CorrMessageRefId — NOT used in CRS
 
-The spec explicitly marks `CorrMessageRefId` as "Optional (non-CRS)" at both MessageSpec (p.9) and DocSpec (p.26) levels. Do not add it to CRS XML output.  
-`corrDocRefId` IS the correct correction reference for CRS.
+The spec marks `CorrMessageRefId` as "Optional (non-CRS)". Do not add it to CRS output.
+`CorrDocRefId` IS the correct correction reference for CRS.
 
-### Multi-value fields
+### Address Element Order (AddressFix)
 
-The schema allows repeating elements that the template handles as single columns:
-- `ResCountryCode` (1..∞), `TIN` (0..∞), `Name` (1..∞), `Address` (1..∞), org `IN` (0..∞)
-
-This is acceptable for standard CRS filings. Edge cases requiring multiple values per field are not supported by the current template design.
+`Street → BuildingIdentifier → SuiteIdentifier → FloorIdentifier → DistrictName → POB → PostCode → City → CountrySubentity`
 
 ---
 
@@ -85,53 +105,29 @@ This is acceptable for standard CRS filings. Edge cases requiring multiple value
 ```
 convert()
 ├── read_sheet() × 6 sheets
-├── For nil return (CRS703): build_message_spec() only
+├── For nil return (CRS703): build_message_header() only
 ├── split_rows() — distributes Individual+Organisation rows into N chunks
 └── Per chunk:
-    ├── build_message_spec()     — unique MessageRefId per split file
-    ├── build_reporting_fi()     — replicated in every split file
+    ├── build_message_header()    — unique MessageRefId per split file
+    ├── build_reporting_fi()      — replicated in every split file
     └── Per account row:
         ├── build_individual_account()   or
         ├── build_organisation_account()
         │   ├── build_doc_spec()
         │   ├── build_account_number()
         │   ├── build_account_balance()
-        │   ├── build_controlling_person() (linked by accountNumber)
-        │   └── build_payment() (linked by accountNumber)
-        └── write_filepath_column()  — adds filepath column to Excel copy
+        │   ├── build_controlling_person()
+        │   └── build_payment()
+        └── write_filepath_column()
 ```
-
-### Why MessageHeader and ReportingFI have no filepath column
-
-Their data appears in **every** split XML file — there is no single filepath to assign. Only `Individual`, `Organisation`, `ControllingPerson`, and `Payment` sheets get the filepath column.
-
----
 
 ## Linking Logic
 
-`ControllingPerson` and `Payment` rows are linked to account rows via `accountNumber` (exact string match). The converter uses `get_linked(df, acc_num)` for this join. Rows with no matching parent account are silently skipped.
-
----
+`ControllingPerson` and `Payment` rows linked to accounts via `accountNumber` (exact string match).
 
 ## Splitting Logic
 
-- Splitting unit = account rows (Individual + Organisation combined).
-- `split_rows()` uses `math.ceil(total / n)` — no file has more than one extra row.
-- Each split file gets a unique `MessageRefId` generated as `{tc}{year}{rc}P{part:02d}{uuid6}`.
-- If `--split N` exceeds the number of account rows, N is capped to the row count.
-
----
-
-## AccountHolder Element Order (schema-required)
-
-Individual: `EquityInterestType → SelfCert → Individual`  
-Organisation: `EquityInterestType → SelfCert → Organisation → AcctHolderType`  
-ControllingPerson: `Individual → CtrlgPersonType → SelfCert`
-
----
-
-## Address Element Order (schema-required, AddressFix)
-
-`Street → BuildingIdentifier → SuiteIdentifier → FloorIdentifier → DistrictName → POB → PostCode → City → CountrySubentity`
-
-If `addressFree` is provided and no structured fields exist, `AddressFree` is used instead of `AddressFix`.
+- Unit = account rows (Individual + Organisation combined)
+- `math.ceil(total / n)` distribution
+- Each split file gets a unique `MessageRefId`
+- `--split N` is capped to the row count if N exceeds total rows
