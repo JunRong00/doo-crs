@@ -433,7 +433,7 @@ def build_message_header(root, header_row, tc, part_num=1, total_parts=1):
         msg_ref_id = provided
     else:
         suffix = f"P{part_num:02d}" if total_parts > 1 else ""
-        msg_ref_id = f"{tc}{sending_in or ''}{uuid.uuid4().hex[:12].upper()}{suffix}"
+        msg_ref_id = f"{tc}2025{sending_in or ''}{uuid.uuid4().hex[:12].upper()}{suffix}"
 
     sub(hdr, tp("MessageRefId"),     msg_ref_id)
     sub(hdr, tp("MessageTypeIndic"), safe(header_row.get("messagetypeindic")) or "CRS701")

@@ -28,12 +28,23 @@ pip install pandas openpyxl
 
 ---
 
-## Files
+## Repository Structure
 
-| File | Description |
-|------|-------------|
-| `xlsx_to_xml_converter.py` | Main converter — reads the Excel template, outputs FC v2.2 XML |
-| `CRS_Template_Revised_2.xlsx` | Blank CRS data entry template (6 sheets) |
+```
+CRS/
+├── xlsx_to_xml_converter.py   # Main converter script
+├── README.md                  # This file
+├── CLAUDE.md                  # Project notes for Claude Code
+├── dd7ee57a-en.pdf            # Reference: OECD CRS XML Schema User Guide v4.0 (Oct 2024)
+└── xml-schema-crs/            # Reference: CRS XML Schema v3.0 XSD files
+    ├── CrsXML_v3.0.xsd
+    ├── oecdcrstypes_v5.0.xsd
+    ├── CommonTypesFatcaCrs_v2.0.xsd
+    ├── FatcaTypes_v1.2.xsd
+    └── isocrstypes_v1.1.xsd
+```
+
+> **Note:** Excel data files (`.xlsx`) and generated output folders (`output_xml*/`) are excluded from version control via `.gitignore`.
 
 ---
 
@@ -56,7 +67,7 @@ The Excel template has **6 sheets**:
 - Row 7: Blank separator
 - Row 8+: Data records
 
-`ControllingPerson` and `Payment` rows are linked to their parent account via the `accountNumber` column (exact match).
+`ControllingPerson` and `Payment` rows are linked to their parent account via the `accountNumber` column (exact string match).
 
 ---
 
@@ -116,6 +127,31 @@ The generated XML uses three namespaces as required by the MDES portal:
 
 ---
 
+## MessageRefId Format
+
+Each XML file is assigned a unique `MessageRefId` generated as:
+
+```
+{TransmittingCountry}2025{SendingCompanyIN}{12-char random hex}{part suffix}
+```
+
+Example (split file 1 of 50):
+```
+VU2025562188A3F9C12D4E8BP01
+```
+
+| Part | Example | Source |
+|------|---------|--------|
+| `VU` | TransmittingCountry | MessageHeader sheet |
+| `2025` | Reporting year | Fixed |
+| `562188` | SendingCompanyIN | MessageHeader sheet |
+| `A3F9C12D4E8B` | 12-char random hex | Auto-generated |
+| `P01` | Part number | Only added when splitting |
+
+If a `MessageRefId` is provided in the Excel and splitting is not used, the provided value is used as-is.
+
+---
+
 ## Splitting Logic
 
 - Splitting unit = account rows (`Individual` + `Organisation` combined).
@@ -134,7 +170,7 @@ Set `MessageTypeIndic` to `CRS703` in the `MessageHeader` sheet to generate a ni
 
 ## Key Notes
 
-- In FC v2.2, both Individual and Organisation accounts use `TIN` (not `IN`) for identification numbers.
+- In FC v2.2, both Individual and Organisation accounts use `TIN` for identification numbers (`IN` is not used).
 - `AcctNumberType` attribute is not supported in FC v2.2 and is omitted from `AccountNumber`.
 - `AddressFix` is preferred over `AddressFree` per MDES portal guidance. Submissions with empty `AddressFix` fields (Street, BuildingIdentifier, PostCode, City) may be flagged for review by the Competent Authority.
-- Reference spec: OECD Amended CRS XML Schema User Guide v4.0, October 2024.
+- Reference spec: OECD Amended CRS XML Schema User Guide v4.0, October 2024 (`dd7ee57a-en.pdf`).
