@@ -54,8 +54,8 @@ Excel data files are not stored in this repository due to sensitive financial da
 
 | File | Description |
 |------|-------------|
-| `CRS_20260528.xlsx` | CRS submission data |
 | `CRS_20260528_v2.xlsx` | CRS submission data (revised) |
+| `CRS_20260528_v2_with_filepath.xlsx` | Revised data with `filepath` column showing which XML file each row was written to |
 
 ---
 
